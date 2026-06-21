@@ -6,7 +6,6 @@ import SPPTree from '../components/SPPTree';
 import DistributionForm from '../components/DistributionForm';
 import ResultsView from '../components/ResultsView';
 import SavedResults from '../components/SavedResults';
-import '../styles/globals.css';
 
 export default function Home() {
   const {
