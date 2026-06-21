@@ -1,6 +1,17 @@
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { useStore } from '../lib/store';
 import styles from './SPPTree.module.css';
+
+const getAllDescendantIds = (node) => {
+  let ids = [];
+  if (node.children && node.children.length > 0) {
+    node.children.forEach((child) => {
+      ids.push(child.id);
+      ids = ids.concat(getAllDescendantIds(child));
+    });
+  }
+  return ids;
+};
 
 const TreeNode = ({ node, distribution }) => {
   const [collapsed, setCollapsed] = useState(false);
@@ -10,20 +21,20 @@ const TreeNode = ({ node, distribution }) => {
 
   const hasChildren = node.children && node.children.length > 0;
   const isSelected = selectedElements.includes(node.id);
-  const distNode = distribution ? distribution[node.code] : null;
-  const amount = distNode ? distNode.amount : null;
+  const amount = distribution?.amount;
 
-  const handleToggleCollapse = () => {
-    setCollapsed(!collapsed);
-  };
+  const handleToggleCollapse = () => setCollapsed(!collapsed);
 
-  const handleCheckboxChange = (e) => {
-    if (e.target.checked) {
-      addSelectedElement(node.id);
+  const handleCheckboxChange = useCallback((e) => {
+    const checked = e.target.checked;
+    const idsToUpdate = [node.id, ...getAllDescendantIds(node)];
+
+    if (checked) {
+      idsToUpdate.forEach((id) => addSelectedElement(id));
     } else {
-      removeSelectedElement(node.id);
+      idsToUpdate.forEach((id) => removeSelectedElement(id));
     }
-  };
+  }, [node, addSelectedElement, removeSelectedElement]);
 
   return (
     <div className={styles.treeNode}>
@@ -35,30 +46,30 @@ const TreeNode = ({ node, distribution }) => {
             </button>
           )}
           {!hasChildren && <span className={styles.toggleBtnPlaceholder} />}
-          
+
           <input
             type="checkbox"
             checked={isSelected}
             onChange={handleCheckboxChange}
             className={styles.checkbox}
           />
-          
+
           <span className={styles.nodeLabel}>
             {node.code} — {node.name}
-            {amount !== null && (
+            {amount !== undefined && (
               <span className={styles.amount}>{amount.toFixed(2)}</span>
             )}
           </span>
         </div>
       </div>
-      
+
       {hasChildren && !collapsed && (
         <div className={styles.children}>
           {node.children.map((child) => (
             <TreeNode
               key={child.id}
               node={child}
-              distribution={distNode ? distNode.children : null}
+              distribution={distribution?.children?.[child.code]}
             />
           ))}
         </div>
@@ -76,7 +87,7 @@ export default function SPPTree({ structure }) {
         <TreeNode
           key={rootNode.id}
           node={rootNode}
-          distribution={distributionResult ? distributionResult[rootNode.code]?.children : null}
+          distribution={distributionResult?.[rootNode.code]}
         />
       ))}
     </div>
