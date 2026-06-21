@@ -1,0 +1,45 @@
+.container {
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 16px;
+}
+
+.loading {
+  font-size: 14px;
+  color: #666;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 12px;
+}
+
+.table th,
+.table td {
+  border: 1px solid #ddd;
+  padding: 8px;
+  text-align: left;
+  font-size: 14px;
+}
+
+.table th {
+  background: #f5f5f5;
+  font-weight: bold;
+}
+
+.table td button {
+  margin-right: 8px;
+  padding: 4px 8px;
+  font-size: 13px;
+  cursor: pointer;
+  background: #0066cc;
+  color: #fff;
+  border: none;
+  border-radius: 3px;
+}
+
+.table td button:hover {
+  background: #004c99;
+}

@@ -1,0 +1,14 @@
+.container {
+  background: #f0f8ff;
+  border: 1px solid #b3d9ff;
+  border-radius: 6px;
+  padding: 12px;
+  margin-top: 16px;
+  font-size: 14px;
+}
+.container h3 {
+  margin: 0 0 8px 0;
+}
+.container p {
+  margin: 4px 0;
+}
