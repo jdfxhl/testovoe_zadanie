@@ -83,8 +83,9 @@ export default function DistributionForm() {
     setSaving(true);
     try {
       const resp = await distributionApi.save(resultId, sessionId);
+      // Обновляем resultId на числовой ID из базы
+      useStore.getState().setResultId(resp.id);
       toast.success('Результат сохранен');
-      // WebSocket will update saved results list automatically
     } catch (err) {
       toast.error('Ошибка сохранения');
     } finally {

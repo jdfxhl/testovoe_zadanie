@@ -61,6 +61,8 @@ export const useStore = create((set) => ({
     resultId,
     showResults: true,
   }),
+  
+  setResultId: (resultId) => set({ resultId }),
 
   setSavedResults: (results) => set({ savedResults: results }),
 

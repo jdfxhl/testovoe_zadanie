@@ -70,7 +70,7 @@ class DistributionResult(db.Model):
     status = db.Column(db.String(20), default='SAVED')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     exported_at = db.Column(db.DateTime)
-    extra_data = db.Column(db.JSON)
+    meta_info = db.Column('metadata', db.JSON)
 
 class UserSession(db.Model):
     __tablename__ = 'user_sessions'
@@ -367,7 +367,7 @@ def save_distribution():
             total_amount=redis_data['total_amount'],
             distribution_data=redis_data['distribution'],
             status='SAVED',
-            extra_data={
+            meta_info={
                 'user_id': user_id,
                 'element_ids': redis_data['element_ids']
             }
