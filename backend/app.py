@@ -38,6 +38,10 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# Database Models
+# ============================================================================
+
 class SPPElement(db.Model):
     __tablename__ = 'spp_elements'
     id = db.Column(db.Integer, primary_key=True)
@@ -82,74 +86,203 @@ class UserSession(db.Model):
     last_activity = db.Column(db.DateTime, default=datetime.utcnow)
     expires_at = db.Column(db.DateTime)
 
+# ============================================================================
+# Helper functions (all use db.text with .mappings() for dictionary access)
+# ============================================================================
+
 def round_to_two_decimals(value):
     return round(float(value), 2)
 
-def distribute_amount(element_ids, total_amount, db_connection=None):
+def get_element_info(element_id, version_date):
+    """Возвращает словарь с информацией об элементе на указанную дату (SCD2)."""
+    if version_date:
+        query = db.text("""
+            SELECT element_id as id, code, name, parent_id, level, status
+            FROM spp_history
+            WHERE element_id = :element_id
+              AND valid_from <= :target_date
+              AND (valid_to IS NULL OR valid_to > :target_date)
+            LIMIT 1
+        """)
+        row = db.session.execute(query, {
+            'element_id': element_id,
+            'target_date': version_date
+        }).mappings().fetchone()
+        if row:
+            return dict(row)   # словарь
+    elem = SPPElement.query.get(element_id)
+    if elem:
+        return {
+            'id': elem.id,
+            'code': elem.code,
+            'name': elem.name,
+            'parent_id': elem.parent_id,
+            'level': elem.level,
+            'status': elem.status
+        }
+    return None
+
+def get_ancestors(element_id, version_date):
+    """Возвращает список id всех предков элемента на дату (SCD2)."""
+    ancestors = []
+    current_id = element_id
+    while current_id is not None:
+        parent_query = db.text("""
+            SELECT h.parent_id
+            FROM spp_history h
+            WHERE h.element_id = :element_id
+              AND h.valid_from <= :target_date
+              AND (h.valid_to IS NULL OR h.valid_to > :target_date)
+            LIMIT 1
+        """)
+        row = db.session.execute(parent_query, {
+            'element_id': current_id,
+            'target_date': version_date
+        }).mappings().fetchone()
+        parent_id = row['parent_id'] if row else None
+        if parent_id is not None:
+            ancestors.append(parent_id)
+            current_id = parent_id
+        else:
+            break
+    return ancestors
+
+def filter_independent_elements(element_ids, version_date):
+    """Оставляет только те элементы, у которых ни один предок не входит в element_ids."""
+    independent = []
+    for eid in element_ids:
+        ancestors = get_ancestors(eid, version_date)
+        if not any(anc in element_ids for anc in ancestors):
+            independent.append(eid)
+    return independent
+
+def _collect_descendants(element_id, version_date, all_ids):
+    """Рекурсивно добавляет id всех активных потомков в множество all_ids."""
+    query = db.text("""
+        SELECT element_id
+        FROM spp_history
+        WHERE parent_id = :parent_id
+          AND valid_from <= :target_date
+          AND (valid_to IS NULL OR valid_to > :target_date)
+          AND status = 'ACTIVE'
+    """)
+    rows = db.session.execute(query, {
+        'parent_id': element_id,
+        'target_date': version_date
+    }).mappings().fetchall()
+    for row in rows:
+        child_id = row['element_id']
+        if child_id not in all_ids:
+            all_ids.add(child_id)
+            _collect_descendants(child_id, version_date, all_ids)
+
+def build_full_tree(top_element_ids, version_date):
+    """
+    Строит полное дерево (словарь) от корней, содержащее всех предков
+    и потомков для указанных top_element_ids.
+    """
+    all_ids = set(top_element_ids)
+    for eid in top_element_ids:
+        ancestors = get_ancestors(eid, version_date)
+        all_ids.update(ancestors)
+        _collect_descendants(eid, version_date, all_ids)
+
+    nodes_info = {}
+    for eid in all_ids:
+        info = get_element_info(eid, version_date)
+        if info:
+            nodes_info[eid] = info
+
+    # Определим корни (элементы, parent_id которых отсутствует в all_ids)
+    roots = []
+    children_map = {eid: [] for eid in all_ids}
+    for eid, info in nodes_info.items():
+        parent_id = info.get('parent_id')
+        if parent_id is None or parent_id not in all_ids:
+            roots.append(info)
+        else:
+            children_map[parent_id].append(eid)
+
+    def build_node(node_info):
+        node = {
+            'id': node_info['id'],
+            'code': node_info['code'],
+            'name': node_info['name'],
+            'level': node_info['level'],
+            'amount': 0.0,
+            'children': {}
+        }
+        for child_id in children_map.get(node_info['id'], []):
+            child_node = build_node(nodes_info[child_id])
+            node['children'][child_node['code']] = child_node
+        return node
+
+    return [build_node(info) for info in roots if info['parent_id'] is None or info['parent_id'] not in all_ids]
+
+def _aggregate_tree(tree):
+    """Рекурсивно вычисляет сумму узла как сумму его потомков."""
+    for node in tree:
+        if node['children']:
+            _aggregate_tree(list(node['children'].values()))
+            node['amount'] = round(sum(child['amount'] for child in node['children'].values()), 2)
+
+def add_hierarchical_numbers(tree, prefix=''):
+    """Присваивает узлам иерархический номер."""
+    for idx, node in enumerate(tree, 1):
+        node['hierarchical_number'] = prefix + str(idx) if prefix else str(idx)
+        if node['children']:
+            add_hierarchical_numbers(list(node['children'].values()), node['hierarchical_number'] + '.')
+
+def assign_amounts(tree, top_element_ids, total_amount):
+    """
+    Распределяет сумму поровну между top_element_ids,
+    затем рекурсивно распределяет долю каждого вниз по потомкам.
+    """
+    if not top_element_ids:
+        return tree
+    amount_per_top = total_amount / len(top_element_ids)
+
+    def distribute_node(node, amount, is_target=False):
+        if node['id'] in top_element_ids:
+            if node['children']:
+                child_amount = amount / len(node['children'])
+                for child in node['children'].values():
+                    distribute_node(child, child_amount, True)
+            else:
+                node['amount'] = round(float(amount), 2)
+        else:
+            if node['children']:
+                child_amount = amount / len(node['children'])
+                for child in node['children'].values():
+                    distribute_node(child, child_amount, is_target)
+            else:
+                node['amount'] = round(float(amount), 2)
+
+    for root in tree:
+        distribute_node(root, amount_per_top, root['id'] in top_element_ids)
+
+    _aggregate_tree(tree)
+    add_hierarchical_numbers(tree)
+    return tree
+
+def calculate_distribution_new(element_ids, total_amount, version_date):
+    """Основная функция расчёта распределения."""
     if not element_ids:
         return {}
-    
-    total_amount = Decimal(str(total_amount))
-    amount_per_element = total_amount / len(element_ids)
-    
+    top_elements = filter_independent_elements(element_ids, version_date)
+    if not top_elements:
+        return {}
+    tree = build_full_tree(top_elements, version_date)
+    total = Decimal(str(total_amount))
+    tree = assign_amounts(tree, top_elements, total)
     result = {}
-    index = 0
-    for element_id in element_ids:
-        element = SPPElement.query.get(element_id)
-        if element:
-            index += 1
-            element_distribution = _distribute_to_children(
-                element,
-                amount_per_element,
-                str(index)
-            )
-            result[element.code] = element_distribution
-    
+    for root in tree:
+        result[root['code']] = root
     return result
 
-def _distribute_to_children(element, amount, prefix=''):
-    children = SPPElement.query.filter_by(
-        parent_id=element.id,
-        status='ACTIVE'
-    ).all()
-    
-    distribution = {
-        'code': element.code,
-        'name': element.name,
-        'amount': round_to_two_decimals(amount),
-        'element_id': element.id,
-        'level': element.level,
-        'hierarchical_number': prefix
-    }
-    
-    if children:
-        amount_per_child = amount / len(children)
-        distribution['children'] = {}
-        child_index = 0
-        for child in children:
-            child_index += 1
-            child_prefix = prefix + '.' + str(child_index)
-            child_distribution = _distribute_to_children(child, amount_per_child, child_prefix)
-            distribution['children'][child.code] = child_distribution
-    
-    return distribution
-
-def aggregate_amounts(distribution_data):
-    def aggregate_recursive(node):
-        if 'children' in node and node['children']:
-            total = Decimal('0')
-            for child_code, child_node in node['children'].items():
-                child_total = aggregate_recursive(child_node)
-                total += Decimal(str(child_total))
-            node['amount'] = round_to_two_decimals(total)
-            return total
-        else:
-            return Decimal(str(node['amount']))
-    
-    for code, node in distribution_data.items():
-        aggregate_recursive(node)
-    
-    return distribution_data
+# ============================================================================
+# API Endpoints
+# ============================================================================
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -165,9 +298,7 @@ def health_check():
 def login():
     user_id = request.json.get('user_id') or f'user-{uuid.uuid4().hex[:8]}'
     session_id = str(uuid.uuid4())
-    
     access_token = create_access_token(identity=user_id)
-    
     user_session = UserSession(
         session_id=session_id,
         user_id=user_id,
@@ -176,7 +307,6 @@ def login():
     )
     db.session.add(user_session)
     db.session.commit()
-    
     return jsonify({
         'access_token': access_token,
         'session_id': session_id,
@@ -187,14 +317,13 @@ def login():
 def get_spp_structure():
     try:
         date_str = request.args.get('date')
-        
         if date_str:
             try:
                 target_date = datetime.strptime(date_str, '%Y-%m-%d')
             except ValueError:
                 return jsonify({'success': False, 'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
 
-            query = """
+            query = db.text("""
                 SELECT 
                     h.element_id AS id,
                     h.code,
@@ -208,26 +337,18 @@ def get_spp_structure():
                   AND (h.valid_to IS NULL OR h.valid_to > :target_date)
                   AND h.status = 'ACTIVE'
                 ORDER BY h.level, h.code
-            """
-            rows = db.session.execute(
-                db.text(query), {'target_date': target_date}
-            ).fetchall()
-            
-            nodes = [dict(row._mapping) for row in rows]
+            """)
+            rows = db.session.execute(query, {'target_date': target_date}).mappings().fetchall()
+            nodes = [dict(row) for row in rows]
             structure = _build_tree_from_dicts(nodes)
         else:
-            root_elements = SPPElement.query.filter_by(
-                parent_id=None,
-                status='ACTIVE'
-            ).all()
+            root_elements = SPPElement.query.filter_by(parent_id=None, status='ACTIVE').all()
             structure = [_build_tree(element) for element in root_elements]
-        
         return jsonify({
             'success': True,
             'structure': structure,
             'timestamp': datetime.utcnow().isoformat()
         }), 200
-    
     except Exception as e:
         logger.error(f"Error fetching SPP structure: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -237,7 +358,6 @@ def _build_tree_from_dicts(nodes):
     for node in nodes:
         node['children'] = []
         node_map[node['id']] = node
-    
     roots = []
     for node in nodes:
         parent_id = node['parent_id']
@@ -247,11 +367,9 @@ def _build_tree_from_dicts(nodes):
             parent = node_map.get(parent_id)
             if parent:
                 parent['children'].append(node)
-    
     for node in nodes:
         if not node['children']:
             del node['children']
-    
     return roots
 
 def _build_tree(element, include_inactive=False):
@@ -263,15 +381,12 @@ def _build_tree(element, include_inactive=False):
         'status': element.status,
         'level': element.level
     }
-    
     query = SPPElement.query.filter_by(parent_id=element.id)
     if not include_inactive:
         query = query.filter_by(status='ACTIVE')
     children = query.all()
-    
     if children:
         tree['children'] = [_build_tree(child, include_inactive) for child in children]
-    
     return tree
 
 @app.route('/api/spp/available-dates', methods=['GET'])
@@ -285,11 +400,7 @@ def get_available_dates():
         """)
         rows = db.session.execute(query).mappings().fetchall()
         dates = [row['version_date'].isoformat() for row in rows]
-        
-        return jsonify({
-            'success': True,
-            'dates': dates
-        }), 200
+        return jsonify({'success': True, 'dates': dates}), 200
     except Exception as e:
         logger.error(f"Error fetching available dates: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -300,36 +411,35 @@ def calculate_distribution():
     try:
         user_id = get_jwt_identity()
         data = request.json
-        
         element_ids = data.get('element_ids', [])
         total_amount = float(data.get('total_amount', 0))
-        version_date = data.get('version_date')
-        
+        version_date_str = data.get('version_date')
+
         if not element_ids or total_amount <= 0:
-            return jsonify({
-                'success': False,
-                'error': 'Invalid element_ids or total_amount'
-            }), 400
-        
-        distribution_result = distribute_amount(element_ids, total_amount)
-        distribution_result = aggregate_amounts(distribution_result)
-        
+            return jsonify({'success': False, 'error': 'Invalid element_ids or total_amount'}), 400
+
+        version_date = None
+        if version_date_str:
+            try:
+                version_date = datetime.strptime(version_date_str, '%Y-%m-%d')
+            except ValueError:
+                return jsonify({'success': False, 'error': 'Invalid version_date format'}), 400
+        else:
+            version_date = datetime.utcnow()
+
+        distribution_result = calculate_distribution_new(element_ids, total_amount, version_date)
+
         result_id = str(uuid.uuid4())
         redis_data = {
             'user_id': user_id,
             'timestamp': datetime.utcnow().isoformat(),
-            'version_date': version_date,
+            'version_date': version_date.strftime('%Y-%m-%d'),
             'total_amount': total_amount,
             'element_ids': element_ids,
             'distribution': distribution_result
         }
-        
-        redis_client.setex(
-            f'distribution:{result_id}',
-            86400,
-            json.dumps(redis_data, default=str)
-        )
-        
+        redis_client.setex(f'distribution:{result_id}', 86400, json.dumps(redis_data, default=str))
+
         return jsonify({
             'success': True,
             'result_id': result_id,
@@ -346,24 +456,24 @@ def save_distribution():
     try:
         user_id = get_jwt_identity()
         data = request.json
-        
         result_id = data.get('result_id')
         session_id = data.get('session_id')
-        
         if not result_id:
             return jsonify({'success': False, 'error': 'result_id required'}), 400
-        
+
         redis_key = f'distribution:{result_id}'
         redis_data = redis_client.get(redis_key)
-        
         if not redis_data:
             return jsonify({'success': False, 'error': 'Distribution result not found'}), 404
-        
         redis_data = json.loads(redis_data)
-        
+
+        version_date = None
+        if redis_data.get('version_date'):
+            version_date = datetime.fromisoformat(redis_data['version_date'])
+
         distribution = DistributionResult(
             session_id=session_id or str(uuid.uuid4()),
-            version_date=datetime.fromisoformat(redis_data['version_date']) if redis_data.get('version_date') else datetime.utcnow(),
+            version_date=version_date or datetime.utcnow(),
             total_amount=redis_data['total_amount'],
             distribution_data=redis_data['distribution'],
             status='SAVED',
@@ -372,16 +482,15 @@ def save_distribution():
                 'element_ids': redis_data['element_ids']
             }
         )
-        
         db.session.add(distribution)
         db.session.commit()
-        
+
         socketio.emit('distribution_saved', {
             'result_id': str(distribution.id),
             'session_id': distribution.session_id,
             'timestamp': datetime.utcnow().isoformat()
         }, room=session_id)
-        
+
         return jsonify({
             'success': True,
             'id': distribution.id,
@@ -396,26 +505,18 @@ def save_distribution():
 def get_saved_results():
     try:
         session_id = request.args.get('session_id')
-        
         if not session_id:
             return jsonify({'success': False, 'error': 'session_id required'}), 400
-        
         results = DistributionResult.query.filter_by(
-            session_id=session_id,
-            status='SAVED'
+            session_id=session_id, status='SAVED'
         ).order_by(DistributionResult.created_at.desc()).all()
-        
         results_data = [{
             'id': r.id,
             'total_amount': float(r.total_amount),
             'created_at': r.created_at.isoformat(),
             'version_date': r.version_date.isoformat() if r.version_date else None
         } for r in results]
-        
-        return jsonify({
-            'success': True,
-            'results': results_data
-        }), 200
+        return jsonify({'success': True, 'results': results_data}), 200
     except Exception as e:
         logger.error(f"Error fetching saved results: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -425,10 +526,8 @@ def get_saved_results():
 def load_distribution(result_id):
     try:
         result = DistributionResult.query.get(result_id)
-        
         if not result:
             return jsonify({'success': False, 'error': 'Distribution result not found'}), 404
-        
         return jsonify({
             'success': True,
             'id': result.id,
@@ -445,97 +544,81 @@ def load_distribution(result_id):
 def export_distribution_excel(result_id):
     try:
         result = DistributionResult.query.get(result_id)
-        
         if not result:
             return jsonify({'success': False, 'error': 'Distribution result not found'}), 404
-        
+
         wb = Workbook()
         ws = wb.active
         ws.title = "Distribution"
-        
+
         ws.column_dimensions['A'].width = 10
         ws.column_dimensions['B'].width = 18
         ws.column_dimensions['C'].width = 25
         ws.column_dimensions['D'].width = 15
         ws.column_dimensions['E'].width = 35
-        
+
         headers = ['Номер', 'Код', 'Наименование', 'Сумма', 'Отделы']
         header_font = Font(bold=True, color="FFFFFF")
         header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-        
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=1, column=col, value=header)
             cell.font = header_font
             cell.fill = header_fill
             cell.alignment = Alignment(horizontal="center", vertical="center")
-        
+
         row = 2
         border = Border(
-            left=Side(style='thin'),
-            right=Side(style='thin'),
-            top=Side(style='thin'),
-            bottom=Side(style='thin')
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin')
         )
-        
+
         def flatten_distribution(dist_data):
             nonlocal row
-            
             for code, node in dist_data.items():
                 hier_num = node.get('hierarchical_number', '')
                 level = node.get('level', 1)
-                
                 departments_str = ''
                 try:
-                    dept_query = """
+                    dept_query = db.text("""
                         SELECT d.name
                         FROM departments d
                         JOIN spp_department_bindings sdb ON d.id = sdb.department_id
                         WHERE sdb.spp_element_id = :element_id
                           AND sdb.valid_from <= :version_date
                           AND (sdb.valid_to IS NULL OR sdb.valid_to > :version_date)
-                    """
-                    dept_rows = db.session.execute(
-                        db.text(dept_query),
-                        {
-                            'element_id': node['element_id'],
-                            'version_date': result.version_date
-                        }
-                    ).fetchall()
-                    departments_str = ', '.join([r.name for r in dept_rows])
+                    """)
+                    dept_rows = db.session.execute(dept_query, {
+                        'element_id': node['id'],
+                        'version_date': result.version_date
+                    }).mappings().fetchall()
+                    departments_str = ', '.join([r['name'] for r in dept_rows])
                 except Exception:
                     departments_str = ''
-                
+
                 ws.cell(row=row, column=1, value=hier_num)
                 ws.cell(row=row, column=2, value=node['code'])
                 ws.cell(row=row, column=3, value=node['name'])
                 ws.cell(row=row, column=4, value=node['amount'])
                 ws.cell(row=row, column=5, value=departments_str)
-                
+
                 for col in range(1, 6):
                     ws.cell(row=row, column=col).border = border
-                
                 ws.cell(row=row, column=1).alignment = Alignment(horizontal="center", vertical="center")
-                ws.cell(row=row, column=3).alignment = Alignment(
-                    indent=level - 1,
-                    horizontal="left",
-                    vertical="center"
-                )
-                
+                ws.cell(row=row, column=3).alignment = Alignment(indent=level - 1, horizontal="left", vertical="center")
                 row += 1
-                
                 if 'children' in node:
                     flatten_distribution(node['children'])
-        
+
         flatten_distribution(result.distribution_data)
-        
+
         output = BytesIO()
         wb.save(output)
         output.seek(0)
-        
+
         result.exported_at = datetime.utcnow()
         result.status = 'EXPORTED'
         db.session.commit()
-        
+
         return send_file(
             output,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -545,6 +628,10 @@ def export_distribution_excel(result_id):
     except Exception as e:
         logger.error(f"Error exporting distribution: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================================
+# WebSocket Events
+# ============================================================================
 
 @socketio.on('connect')
 def handle_connect():
@@ -556,10 +643,7 @@ def on_join_session(data):
     session_id = data.get('session_id')
     if session_id:
         join_room(session_id)
-        emit('joined_session', {
-            'session_id': session_id,
-            'timestamp': datetime.utcnow().isoformat()
-        })
+        emit('joined_session', {'session_id': session_id, 'timestamp': datetime.utcnow().isoformat()})
         logger.info(f"Client {request.sid} joined session {session_id}")
 
 @socketio.on('leave_session')
@@ -585,5 +669,4 @@ def server_error(e):
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-    
     socketio.run(app, host='0.0.0.0', port=5000, debug=False)
