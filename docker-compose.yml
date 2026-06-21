@@ -1,0 +1,88 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: spp_postgres
+    environment:
+      POSTGRES_DB: spp_db
+      POSTGRES_USER: spp_user
+      POSTGRES_PASSWORD: spp_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/db/init.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./backend/db/demo_data.sql:/docker-entrypoint-initdb.d/02-demo.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spp_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - spp_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: spp_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - spp_network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: spp_backend
+    environment:
+      FLASK_APP: app.py
+      FLASK_ENV: development
+      DATABASE_URL: postgresql://spp_user:spp_password@postgres:5432/spp_db
+      REDIS_URL: redis://redis:6379/0
+      PYTHONUNBUFFERED: 1
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - spp_network
+    command: python app.py
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: spp_frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:5000
+      NODE_ENV: development
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - spp_network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  spp_network:
+    driver: bridge
