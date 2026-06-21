@@ -163,7 +163,7 @@ def health_check():
 
 @app.route('/api/auth/login', methods=['POST'])
 def login():
-    user_id = request.json.get('user_id', f'user-{uuid.uuid4().hex[:8]}')
+    user_id = request.json.get('user_id') or f'user-{uuid.uuid4().hex[:8]}'
     session_id = str(uuid.uuid4())
     
     access_token = create_access_token(identity=user_id)
@@ -210,7 +210,7 @@ def get_spp_structure():
                 ORDER BY h.level, h.code
             """
             rows = db.session.execute(
-                query, {'target_date': target_date}
+                db.text(query), {'target_date': target_date}
             ).fetchall()
             
             nodes = [dict(row._mapping) for row in rows]
@@ -277,14 +277,14 @@ def _build_tree(element, include_inactive=False):
 @app.route('/api/spp/available-dates', methods=['GET'])
 def get_available_dates():
     try:
-        query = """
+        query = db.text("""
             SELECT DISTINCT DATE(valid_from) as version_date
             FROM spp_history
             ORDER BY version_date DESC
             LIMIT 30
-        """
-        rows = db.session.execute(query).fetchall()
-        dates = [row.version_date.isoformat() for row in rows]
+        """)
+        rows = db.session.execute(query).mappings().fetchall()
+        dates = [row['version_date'].isoformat() for row in rows]
         
         return jsonify({
             'success': True,
@@ -367,7 +367,7 @@ def save_distribution():
             total_amount=redis_data['total_amount'],
             distribution_data=redis_data['distribution'],
             status='SAVED',
-            ave_distribution={
+            extra_data={
                 'user_id': user_id,
                 'element_ids': redis_data['element_ids']
             }
@@ -495,7 +495,7 @@ def export_distribution_excel(result_id):
                           AND (sdb.valid_to IS NULL OR sdb.valid_to > :version_date)
                     """
                     dept_rows = db.session.execute(
-                        dept_query,
+                        db.text(dept_query),
                         {
                             'element_id': node['element_id'],
                             'version_date': result.version_date
